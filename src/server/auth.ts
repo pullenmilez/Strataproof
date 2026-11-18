@@ -1,15 +1,39 @@
 import crypto from "crypto";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
-import { UserRole } from "./enums";
-import { getStore, Organisation, User } from "./store";
+import { db } from "../db/index.ts";
+import {
+  organisationMemberships,
+  organisations,
+  users,
+} from "../db/schema.ts";
+import { adminAuth } from "../lib/firebase-admin.ts";
+import { UserRole } from "./enums.ts";
 
 const SECRET =
   process.env.APP_SECRET_KEY ||
   "strataproof-dev-ephemeral-secret-key-not-for-production-use";
 
+export interface TenantUser {
+  id: string;
+  uid: string | null;
+  email: string;
+  fullName: string;
+  professionalCredentials: string | null;
+  isActive: boolean;
+}
+
+export interface TenantOrganisation {
+  id: string;
+  name: string;
+  slug: string;
+  country: string;
+  aiProcessingAuthorized: boolean;
+}
+
 export interface TenantContext {
-  user: User;
-  organisation: Organisation;
+  user: TenantUser;
+  organisation: TenantOrganisation;
   role: UserRole;
 }
 
@@ -26,7 +50,8 @@ export function hashPassword(password: string): string {
   return `${salt}:${derived}`;
 }
 
-export function verifyPassword(password: string, storedHash: string): boolean {
+export function verifyPassword(password: string, storedHash: string | null): boolean {
+  if (!storedHash) return false;
   const [salt, keyHex] = storedHash.split(":");
   if (!salt || !keyHex) return false;
   const derived = crypto.scryptSync(password, salt, 64);
@@ -115,10 +140,67 @@ export function verifyDownloadSignature(
   return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(expected));
 }
 
-export function getTenantContext(
+export async function getOrCreateFirebaseUser(
+  uid: string,
+  email: string,
+  fullName?: string | null
+) {
+  try {
+    const normalizedEmail = email.toLowerCase().trim();
+    const existingByEmail = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, normalizedEmail));
+
+    if (existingByEmail.length > 0 && !existingByEmail[0].uid) {
+      const [updated] = await db
+        .update(users)
+        .set({ uid })
+        .where(eq(users.id, existingByEmail[0].id))
+        .returning();
+      return updated;
+    }
+
+    const result = await db
+      .insert(users)
+      .values({
+        id: crypto.randomUUID(),
+        uid,
+        email: normalizedEmail,
+        fullName: (fullName || normalizedEmail.split("@")[0] || "Geoscientist").trim(),
+        passwordHash: null,
+        isActive: true,
+      })
+      .onConflictDoUpdate({
+        target: users.uid,
+        set: {
+          email: normalizedEmail,
+        },
+      })
+      .returning();
+
+    return result[0];
+  } catch (error) {
+    console.error("Failed to upsert Firebase user:", error);
+    throw new Error("Database query failed. Please try again later.", { cause: error });
+  }
+}
+
+export async function verifyFirebaseBearerToken(req: NextRequest) {
+  const authHeader = req.headers.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  if (!token) return null;
+  try {
+    return await adminAuth.verifyIdToken(token);
+  } catch {
+    return null;
+  }
+}
+
+export async function getTenantContext(
   req: NextRequest,
   allowedRoles?: UserRole[]
-): { ctx: TenantContext } | { error: NextResponse } {
+): Promise<{ ctx: TenantContext } | { error: NextResponse }> {
   const authHeader = req.headers.get("authorization") || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
   if (!token) {
@@ -127,61 +209,142 @@ export function getTenantContext(
     };
   }
 
-  const decoded = verifyAccessToken(token);
-  if (!decoded) {
-    return {
-      error: NextResponse.json({ detail: "Invalid or expired token." }, { status: 401 }),
-    };
-  }
-
   const headerOrgId = req.headers.get("x-organisation-id");
-  if (headerOrgId && headerOrgId !== decoded.org_id) {
+
+  try {
+    // 1. Check custom tenant HMAC JWT
+    const decodedJwt = verifyAccessToken(token);
+    if (decodedJwt) {
+      if (headerOrgId && headerOrgId !== decodedJwt.org_id) {
+        return {
+          error: NextResponse.json(
+            { detail: "X-Organisation-ID does not match active tenant token." },
+            { status: 403 }
+          ),
+        };
+      }
+
+      const [user] = await db.select().from(users).where(eq(users.id, decodedJwt.sub));
+      const [org] = await db
+        .select()
+        .from(organisations)
+        .where(eq(organisations.id, decodedJwt.org_id));
+
+      if (!user || !user.isActive || !org) {
+        return {
+          error: NextResponse.json({ detail: "Invalid tenant context." }, { status: 401 }),
+        };
+      }
+
+      const [membership] = await db
+        .select()
+        .from(organisationMemberships)
+        .where(
+          and(
+            eq(organisationMemberships.userId, user.id),
+            eq(organisationMemberships.organisationId, org.id),
+            isNull(organisationMemberships.deletedAt)
+          )
+        );
+
+      if (!membership) {
+        return {
+          error: NextResponse.json(
+            { detail: "No active membership in organisation." },
+            { status: 403 }
+          ),
+        };
+      }
+
+      const role = membership.role as UserRole;
+      if (allowedRoles && !allowedRoles.includes(role)) {
+        return {
+          error: NextResponse.json(
+            { detail: "Insufficient role privileges for this operation." },
+            { status: 403 }
+          ),
+        };
+      }
+
+      return { ctx: { user, organisation: org, role } };
+    }
+
+    // 2. Fallback to Firebase ID Token verification
+    let decodedFirebase;
+    try {
+      decodedFirebase = await adminAuth.verifyIdToken(token);
+    } catch {
+      return {
+        error: NextResponse.json({ detail: "Invalid or expired token." }, { status: 401 }),
+      };
+    }
+
+    const fbEmail = decodedFirebase.email || `${decodedFirebase.uid}@google.local`;
+    const dbUser = await getOrCreateFirebaseUser(
+      decodedFirebase.uid,
+      fbEmail,
+      decodedFirebase.name
+    );
+
+    if (!dbUser.isActive) {
+      return {
+        error: NextResponse.json({ detail: "User account is disabled." }, { status: 403 }),
+      };
+    }
+
+    const memberships = await db
+      .select()
+      .from(organisationMemberships)
+      .where(
+        and(
+          eq(organisationMemberships.userId, dbUser.id),
+          isNull(organisationMemberships.deletedAt)
+        )
+      )
+      .orderBy(desc(organisationMemberships.isDefault));
+
+    const targetMembership = headerOrgId
+      ? memberships.find((m) => m.organisationId === headerOrgId)
+      : memberships[0];
+
+    if (!targetMembership) {
+      return {
+        error: NextResponse.json(
+          { detail: "No active organisation membership found." },
+          { status: 403 }
+        ),
+      };
+    }
+
+    const [org] = await db
+      .select()
+      .from(organisations)
+      .where(eq(organisations.id, targetMembership.organisationId));
+
+    if (!org) {
+      return {
+        error: NextResponse.json({ detail: "Invalid organisation." }, { status: 403 }),
+      };
+    }
+
+    const role = targetMembership.role as UserRole;
+    if (allowedRoles && !allowedRoles.includes(role)) {
+      return {
+        error: NextResponse.json(
+          { detail: "Insufficient role privileges for this operation." },
+          { status: 403 }
+        ),
+      };
+    }
+
+    return { ctx: { user: dbUser, organisation: org, role } };
+  } catch (error) {
+    console.error("Tenant auth verification failed:", error);
     return {
       error: NextResponse.json(
-        { detail: "X-Organisation-ID does not match active tenant token." },
-        { status: 403 }
+        { detail: "Authentication service error. Please try again." },
+        { status: 500 }
       ),
     };
   }
-
-  const store = getStore();
-  const user = store.users.get(decoded.sub);
-  const org = store.organisations.get(decoded.org_id);
-  if (!user || !user.is_active || !org) {
-    return {
-      error: NextResponse.json({ detail: "Invalid tenant context." }, { status: 401 }),
-    };
-  }
-
-  const membership = store.memberships.find(
-    (m) =>
-      m.user_id === user.id &&
-      m.organisation_id === org.id &&
-      m.deleted_at === null
-  );
-  if (!membership) {
-    return {
-      error: NextResponse.json(
-        { detail: "No active membership in organisation." },
-        { status: 403 }
-      ),
-    };
-  }
-
-  if (allowedRoles && !allowedRoles.includes(membership.role)) {
-    return {
-      error: NextResponse.json(
-        { detail: "Insufficient role privileges for this operation." },
-        { status: 403 }
-      ),
-    };
-  }
-
-  return {
-    ctx: {
-      user,
-      organisation: org,
-      role: membership.role,
-    },
-  };
 }

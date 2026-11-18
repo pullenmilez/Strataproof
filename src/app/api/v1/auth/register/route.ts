@@ -1,8 +1,15 @@
 import crypto from "crypto";
+import { eq } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
-import { createAccessToken, hashPassword } from "@/server/auth";
-import { UserRole } from "@/server/enums";
-import { getStore, recordAuditEvent } from "@/server/store";
+import { db } from "@/db/index.ts";
+import {
+  organisationMemberships,
+  organisations,
+  users,
+} from "@/db/schema.ts";
+import { recordAuditEvent } from "@/server/audit.ts";
+import { createAccessToken, hashPassword } from "@/server/auth.ts";
+import { UserRole } from "@/server/enums.ts";
 
 function slugify(name: string): string {
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "org";
@@ -34,55 +41,50 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ detail: "Organisation name is required." }, { status: 422 });
     }
 
-    const store = getStore();
-    for (const u of store.users.values()) {
-      if (u.email === email) {
-        return NextResponse.json({ detail: "Email is already registered." }, { status: 409 });
-      }
+    const existingUsers = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
+    if (existingUsers.length > 0) {
+      return NextResponse.json({ detail: "Email is already registered." }, { status: 409 });
     }
 
     const slugBase = slugify(orgName);
     let slug = slugBase;
     let suffix = 1;
-    const existingSlugs = new Set(Array.from(store.organisations.values()).map((o) => o.slug));
-    while (existingSlugs.has(slug)) {
+    while ((await db.select({ id: organisations.id }).from(organisations).where(eq(organisations.slug, slug))).length > 0) {
       suffix += 1;
       slug = `${slugBase}-${suffix}`;
     }
 
-    const now = new Date().toISOString();
     const orgId = crypto.randomUUID();
     const userId = crypto.randomUUID();
 
-    store.organisations.set(orgId, {
+    await db.insert(organisations).values({
       id: orgId,
       name: orgName,
       slug,
       country,
-      ai_processing_authorized: false,
-      created_at: now,
+      aiProcessingAuthorized: false,
     });
 
-    store.users.set(userId, {
+    await db.insert(users).values({
       id: userId,
+      uid: null,
       email,
-      full_name: fullName,
-      password_hash: hashPassword(password),
-      professional_credentials: professionalCredentials,
-      is_active: true,
-      created_at: now,
+      fullName,
+      passwordHash: hashPassword(password),
+      professionalCredentials,
+      isActive: true,
     });
 
-    store.memberships.push({
+    await db.insert(organisationMemberships).values({
       id: crypto.randomUUID(),
-      organisation_id: orgId,
-      user_id: userId,
+      organisationId: orgId,
+      userId,
       role: UserRole.ORG_ADMIN,
-      is_default: true,
-      deleted_at: null,
+      isDefault: true,
+      deletedAt: null,
     });
 
-    recordAuditEvent({
+    await recordAuditEvent({
       organisation_id: orgId,
       actor_user_id: userId,
       event_type: "ORGANISATION_AND_ADMIN_REGISTERED",
@@ -102,7 +104,8 @@ export async function POST(req: NextRequest) {
       },
       { status: 201 }
     );
-  } catch {
-    return NextResponse.json({ detail: "Invalid registration payload." }, { status: 400 });
+  } catch (error) {
+    console.error("Registration failed:", error);
+    return NextResponse.json({ detail: "Registration failed. Please try again." }, { status: 500 });
   }
 }

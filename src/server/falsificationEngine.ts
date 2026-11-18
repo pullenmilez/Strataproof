@@ -1,4 +1,17 @@
 import crypto from "crypto";
+import { and, eq, inArray, isNull, ne } from "drizzle-orm";
+import { db } from "../db/index.ts";
+import {
+  analysisRuns,
+  basinProfiles,
+  claimEvidences,
+  contradictions,
+  falsificationHypotheses,
+  geologicalClaims,
+  investigations,
+  knowledgeClaims,
+  petroleumSystemElements,
+} from "../db/schema.ts";
 import {
   ALL_PETROLEUM_SYSTEM_ELEMENTS,
   PetroleumSystemElementType,
@@ -6,15 +19,7 @@ import {
   QualitativeStatus,
   ReviewStatus,
   SourceQualityTier,
-} from "./enums";
-import {
-  AnalysisRun,
-  FalsificationHypothesis,
-  getStore,
-  Investigation,
-  PetroleumSystemElement,
-  Prospect,
-} from "./store";
+} from "./enums.ts";
 
 const DEFAULT_FAILURE_MODES: Record<PetroleumSystemElementType, [string, string]> = {
   [PetroleumSystemElementType.SOURCE_ROCK]: [
@@ -116,210 +121,280 @@ const INVESTIGATION_TEMPLATES: Record<
   ],
 };
 
-export function runPetroleumSystemFalsification(
-  prospect: Prospect,
+type ProspectRow = typeof import("../db/schema.ts").prospects.$inferSelect;
+type HypothesisRow = typeof falsificationHypotheses.$inferSelect;
+
+export async function runPetroleumSystemFalsification(
+  prospect: ProspectRow,
   triggeredByUserId: string
-): AnalysisRun {
-  const store = getStore();
-  const startedAt = new Date().toISOString();
+) {
+  try {
+    const runId = crypto.randomUUID();
+    const [run] = await db
+      .insert(analysisRuns)
+      .values({
+        id: runId,
+        organisationId: prospect.organisationId,
+        prospectId: prospect.id,
+        runType: "FALSIFICATION_ANALYSIS",
+        triggeredBy: triggeredByUserId,
+        executedRuleVersions: [{ engine: "petroleum_system_falsification", version: "v1.0.0" }],
+        aiModelUsed: "deterministic-geological-synthesis-v1",
+        status: ProcessingStatus.COMPLETED,
+        startedAt: new Date(),
+        completedAt: null,
+      })
+      .returning();
 
-  const run: AnalysisRun = {
-    id: crypto.randomUUID(),
-    organisation_id: prospect.organisation_id,
-    prospect_id: prospect.id,
-    run_type: "FALSIFICATION_ANALYSIS",
-    triggered_by: triggeredByUserId,
-    executed_rule_versions: [{ engine: "petroleum_system_falsification", version: "v1.0.0" }],
-    ai_model_used: "deterministic-geological-synthesis-v1",
-    status: ProcessingStatus.COMPLETED,
-    started_at: startedAt,
-    completed_at: null,
-  };
-  store.analysisRuns.push(run);
+    const basinRows = prospect.basinProfileId
+      ? await db
+          .select()
+          .from(basinProfiles)
+          .where(eq(basinProfiles.id, prospect.basinProfileId))
+      : [];
+    const basinProfile = basinRows[0] ?? null;
 
-  const basinProfile = prospect.basin_profile_id
-    ? store.basins.get(prospect.basin_profile_id) ?? null
-    : null;
+    const allVerifiedKnowledge = await db
+      .select()
+      .from(knowledgeClaims)
+      .where(
+        and(
+          inArray(knowledgeClaims.reviewStatus, [
+            ReviewStatus.APPROVED,
+            ReviewStatus.CONDITIONALLY_APPROVED,
+          ]),
+          ne(knowledgeClaims.sourceQualityTier, SourceQualityTier.QUARANTINED_UNVERIFIED)
+        )
+      );
 
-  // Strict APPROVED/CONDITIONALLY_APPROVED retrieval gating from Environment B
-  const verifiedCitations = Array.from(store.knowledgeClaims.values())
-    .filter(
-      (kc) =>
-        kc.country.toLowerCase() === prospect.country.toLowerCase() &&
-        kc.basin.toLowerCase() === prospect.basin_name.toLowerCase() &&
-        (kc.review_status === ReviewStatus.APPROVED ||
-          kc.review_status === ReviewStatus.CONDITIONALLY_APPROVED) &&
-        kc.source_quality_tier !== SourceQualityTier.QUARANTINED_UNVERIFIED
-    )
-    .slice(0, 10);
+    const verifiedCitations = allVerifiedKnowledge
+      .filter(
+        (kc) =>
+          kc.country.toLowerCase() === prospect.country.toLowerCase() &&
+          kc.basin.toLowerCase() === prospect.basinName.toLowerCase()
+      )
+      .slice(0, 10);
 
-  const claims = Array.from(store.claims.values()).filter(
-    (c) =>
-      c.prospect_id === prospect.id &&
-      c.organisation_id === prospect.organisation_id &&
-      c.deleted_at === null
-  );
+    const claims = await db
+      .select()
+      .from(geologicalClaims)
+      .where(
+        and(
+          eq(geologicalClaims.prospectId, prospect.id),
+          eq(geologicalClaims.organisationId, prospect.organisationId),
+          isNull(geologicalClaims.deletedAt)
+        )
+      );
 
-  const openContradictions = Array.from(store.contradictions.values()).filter(
-    (ct) =>
-      ct.prospect_id === prospect.id &&
-      ct.organisation_id === prospect.organisation_id &&
-      ct.deleted_at === null
-  );
+    const allLinks = await db
+      .select()
+      .from(claimEvidences)
+      .where(eq(claimEvidences.organisationId, prospect.organisationId));
 
-  // Clear prior unreviewed hypotheses for clean re-run
-  for (const [hid, h] of store.hypotheses.entries()) {
-    if (
-      h.prospect_id === prospect.id &&
-      h.organisation_id === prospect.organisation_id &&
-      h.review_status === ReviewStatus.AI_SUGGESTED_PENDING_REVIEW
-    ) {
-      store.hypotheses.delete(hid);
-    }
-  }
+    const openContradictions = await db
+      .select()
+      .from(contradictions)
+      .where(
+        and(
+          eq(contradictions.prospectId, prospect.id),
+          eq(contradictions.organisationId, prospect.organisationId),
+          isNull(contradictions.deletedAt)
+        )
+      );
 
-  const hypothesesForRanking: Array<{
-    hyp: FalsificationHypothesis;
-    elemType: PetroleumSystemElementType;
-  }> = [];
+    await db
+      .delete(falsificationHypotheses)
+      .where(
+        and(
+          eq(falsificationHypotheses.prospectId, prospect.id),
+          eq(falsificationHypotheses.organisationId, prospect.organisationId),
+          eq(falsificationHypotheses.reviewStatus, ReviewStatus.AI_SUGGESTED_PENDING_REVIEW)
+        )
+      );
 
-  for (const elemType of ALL_PETROLEUM_SYSTEM_ELEMENTS) {
-    const elemClaims = claims.filter((c) => c.petroleum_system_element === elemType);
-    const supportingIds: string[] = [];
-    const opposingIds: string[] = [];
+    const existingPsElements = await db
+      .select()
+      .from(petroleumSystemElements)
+      .where(
+        and(
+          eq(petroleumSystemElements.prospectId, prospect.id),
+          eq(petroleumSystemElements.organisationId, prospect.organisationId)
+        )
+      );
 
-    for (const c of elemClaims) {
-      for (const lk of store.claimEvidences) {
-        if (lk.claim_id === c.id) {
-          if (lk.relationship_role === "SUPPORTING") supportingIds.push(lk.evidence_id);
-          else if (lk.relationship_role === "OPPOSING") opposingIds.push(lk.evidence_id);
+    const hypothesesForRanking: Array<{
+      hyp: HypothesisRow;
+      elemType: PetroleumSystemElementType;
+    }> = [];
+
+    for (const elemType of ALL_PETROLEUM_SYSTEM_ELEMENTS) {
+      const elemClaims = claims.filter((c) => c.petroleumSystemElement === elemType);
+      const supportingIds: string[] = [];
+      const opposingIds: string[] = [];
+
+      for (const c of elemClaims) {
+        for (const lk of allLinks) {
+          if (lk.claimId === c.id) {
+            if (lk.relationshipRole === "SUPPORTING") supportingIds.push(lk.evidenceId);
+            else if (lk.relationshipRole === "OPPOSING") opposingIds.push(lk.evidenceId);
+          }
         }
       }
-    }
 
-    const elemContradictions = openContradictions.filter((ct) =>
-      (ct.well_or_interval || "").includes(elemType)
-    );
-    const missingItems: string[] = [];
-    let statusVal: QualitativeStatus;
-    let rationale: string;
+      const elemContradictions = openContradictions.filter((ct) =>
+        (ct.wellOrInterval || "").includes(elemType)
+      );
+      const missingItems: string[] = [];
+      let statusVal: QualitativeStatus;
+      let rationale: string;
 
-    if (elemClaims.length === 0) {
-      statusVal = QualitativeStatus.INSUFFICIENT_EVIDENCE;
-      missingItems.push(`No geological claims registered for ${elemType}.`);
-      rationale = `Insufficient evidence: zero geological claims or primary records evaluate ${elemType}.`;
-    } else if (opposingIds.length > 0 && supportingIds.length > 0) {
-      statusVal = QualitativeStatus.MIXED_EVIDENCE;
-      rationale = `Mixed evidence: ${supportingIds.length} supporting and ${opposingIds.length} opposing evidence item(s) linked across ${elemClaims.length} claim(s).`;
-    } else if (opposingIds.length > 0 || elemContradictions.length > 0) {
-      statusVal = QualitativeStatus.CONTRADICTED;
-      rationale = `Contradicted or contested: ${opposingIds.length} opposing evidence item(s) and ${elemContradictions.length} validation contradiction(s) affect ${elemType}.`;
-    } else if (supportingIds.length > 0) {
-      const allApproved = elemClaims.every((c) => c.review_status === ReviewStatus.APPROVED);
-      statusVal = allApproved
-        ? QualitativeStatus.SUPPORTED
-        : QualitativeStatus.PARTIALLY_SUPPORTED;
-      if (!allApproved) {
-        missingItems.push("One or more supporting claims have not yet completed peer review.");
+      if (elemClaims.length === 0) {
+        statusVal = QualitativeStatus.INSUFFICIENT_EVIDENCE;
+        missingItems.push(`No geological claims registered for ${elemType}.`);
+        rationale = `Insufficient evidence: zero geological claims or primary records evaluate ${elemType}.`;
+      } else if (opposingIds.length > 0 && supportingIds.length > 0) {
+        statusVal = QualitativeStatus.MIXED_EVIDENCE;
+        rationale = `Mixed evidence: ${supportingIds.length} supporting and ${opposingIds.length} opposing evidence item(s) linked across ${elemClaims.length} claim(s).`;
+      } else if (opposingIds.length > 0 || elemContradictions.length > 0) {
+        statusVal = QualitativeStatus.CONTRADICTED;
+        rationale = `Contradicted or contested: ${opposingIds.length} opposing evidence item(s) and ${elemContradictions.length} validation contradiction(s) affect ${elemType}.`;
+      } else if (supportingIds.length > 0) {
+        const allApproved = elemClaims.every((c) => c.reviewStatus === ReviewStatus.APPROVED);
+        statusVal = allApproved
+          ? QualitativeStatus.SUPPORTED
+          : QualitativeStatus.PARTIALLY_SUPPORTED;
+        if (!allApproved) {
+          missingItems.push("One or more supporting claims have not yet completed peer review.");
+        }
+        rationale = `${statusVal}: backed by ${supportingIds.length} linked evidence item(s) across ${elemClaims.length} claim(s).`;
+      } else {
+        statusVal = QualitativeStatus.WEAKLY_SUPPORTED;
+        missingItems.push(`Claims exist for ${elemType} but lack linked primary EvidenceItems.`);
+        rationale = `Weakly supported: ${elemClaims.length} claim(s) stated without linked primary documentary evidence.`;
       }
-      rationale = `${statusVal}: backed by ${supportingIds.length} linked evidence item(s) across ${elemClaims.length} claim(s).`;
-    } else {
-      statusVal = QualitativeStatus.WEAKLY_SUPPORTED;
-      missingItems.push(`Claims exist for ${elemType} but lack linked primary EvidenceItems.`);
-      rationale = `Weakly supported: ${elemClaims.length} claim(s) stated without linked primary documentary evidence.`;
+
+      let psElem = existingPsElements.find((ps) => ps.elementType === elemType);
+      if (!psElem) {
+        const [inserted] = await db
+          .insert(petroleumSystemElements)
+          .values({
+            id: crypto.randomUUID(),
+            organisationId: prospect.organisationId,
+            prospectId: prospect.id,
+            elementType: elemType,
+            qualitativeStatus: statusVal,
+            statusRationale: rationale,
+            missingEvidenceSummary: missingItems,
+            reviewStatus: ReviewStatus.UNREVIEWED,
+          })
+          .returning();
+        psElem = inserted;
+      } else {
+        const [updated] = await db
+          .update(petroleumSystemElements)
+          .set({
+            qualitativeStatus: statusVal,
+            statusRationale: rationale,
+            missingEvidenceSummary: missingItems,
+          })
+          .where(eq(petroleumSystemElements.id, psElem.id))
+          .returning();
+        psElem = updated;
+      }
+
+      const [baseMechanism, baseRelevance] = DEFAULT_FAILURE_MODES[elemType];
+      const relevance = basinProfile
+        ? `${baseRelevance} Basin context (${basinProfile.basinName}): ${basinProfile.knownUncertaintiesAndGaps}`
+        : baseRelevance;
+
+      const kSourceIds = Array.from(
+        new Set(verifiedCitations.flatMap((vc) => vc.sourceIds || []))
+      );
+
+      const [hyp] = await db
+        .insert(falsificationHypotheses)
+        .values({
+          id: crypto.randomUUID(),
+          organisationId: prospect.organisationId,
+          prospectId: prospect.id,
+          elementId: psElem.id,
+          analysisRunId: run.id,
+          proposedFailureMechanism: baseMechanism,
+          geologicalApplicability: `${prospect.country} — ${prospect.basinName} (${elemType})`,
+          relevanceConditions: relevance,
+          missingEvidence: missingItems,
+          knowledgeSourceIds: kSourceIds,
+          confidenceRationale: `Qualitative assessment status is ${statusVal}. Grounded in ${supportingIds.length} supporting, ${opposingIds.length} opposing prospect evidence items, and ${verifiedCitations.length} verified regional knowledge record(s).`,
+          isAiSuggested: true,
+          reviewStatus: ReviewStatus.AI_SUGGESTED_PENDING_REVIEW,
+          reviewedBy: null,
+          reviewerNotes: null,
+          deletedAt: null,
+        })
+        .returning();
+
+      hypothesesForRanking.push({ hyp, elemType });
     }
 
-    let psElem = store.petroleumSystemElements.find(
-      (ps) => ps.prospect_id === prospect.id && ps.element_type === elemType
+    await db
+      .delete(investigations)
+      .where(
+        and(
+          eq(investigations.prospectId, prospect.id),
+          eq(investigations.organisationId, prospect.organisationId)
+        )
+      );
+
+    const scored = hypothesesForRanking
+      .map(({ hyp, elemType }) => {
+        const baseScore = ELEMENT_DISCRIMINATION_WEIGHT[elemType] ?? 50;
+        const gapBonus = Math.min(hyp.missingEvidence.length * 4, 20);
+        return { score: baseScore + gapBonus, hyp, elemType };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    await db.insert(investigations).values(
+      scored.map((item, idx) => {
+        const rank = idx + 1;
+        const [title, obj, reqTest, feasibility] = INVESTIGATION_TEMPLATES[item.elemType];
+        const decisionRel = rank <= 3 ? "CRITICAL" : rank <= 6 ? "HIGH" : "MODERATE";
+        return {
+          id: crypto.randomUUID(),
+          organisationId: prospect.organisationId,
+          prospectId: prospect.id,
+          hypothesisId: item.hyp.id,
+          title,
+          discriminatingObjective: obj,
+          requiredDataOrTest: reqTest,
+          userSuppliedCostEstimate: null,
+          userSuppliedTimeEstimate: null,
+          technicalFeasibilityNote: feasibility,
+          priorityRank: rank,
+          decisionRelevance: decisionRel,
+          discriminationPower: `Directly tests ${item.elemType} failure hypothesis (Rank #${rank})`,
+          prioritisationRationale: `Ranked #${rank} based on structural/petroleum-system criticality of ${item.elemType} and ${item.hyp.missingEvidence.length} unresolved evidence gap(s). Cost and duration remain user-supplied.`,
+        };
+      })
     );
-    if (!psElem) {
-      psElem = {
-        id: crypto.randomUUID(),
-        organisation_id: prospect.organisation_id,
-        prospect_id: prospect.id,
-        element_type: elemType,
-        qualitative_status: statusVal,
-        status_rationale: rationale,
-        missing_evidence_summary: missingItems,
-        review_status: ReviewStatus.UNREVIEWED,
-      };
-      store.petroleumSystemElements.push(psElem);
-    } else {
-      psElem.qualitative_status = statusVal;
-      psElem.status_rationale = rationale;
-      psElem.missing_evidence_summary = missingItems;
-    }
 
-    const [baseMechanism, baseRelevance] = DEFAULT_FAILURE_MODES[elemType];
-    const relevance = basinProfile
-      ? `${baseRelevance} Basin context (${basinProfile.basin_name}): ${basinProfile.known_uncertainties_and_gaps}`
-      : baseRelevance;
+    const [updatedRun] = await db
+      .update(analysisRuns)
+      .set({ completedAt: new Date() })
+      .where(eq(analysisRuns.id, run.id))
+      .returning();
 
-    const kSourceIds = Array.from(
-      new Set(verifiedCitations.flatMap((vc) => vc.source_ids || []))
-    );
-
-    const hypId = crypto.randomUUID();
-    const hyp: FalsificationHypothesis = {
-      id: hypId,
-      organisation_id: prospect.organisation_id,
-      prospect_id: prospect.id,
-      element_id: psElem.id,
-      analysis_run_id: run.id,
-      proposed_failure_mechanism: baseMechanism,
-      geological_applicability: `${prospect.country} — ${prospect.basin_name} (${elemType})`,
-      relevance_conditions: relevance,
-      missing_evidence: missingItems,
-      knowledge_source_ids: kSourceIds,
-      confidence_rationale: `Qualitative assessment status is ${statusVal}. Grounded in ${supportingIds.length} supporting, ${opposingIds.length} opposing prospect evidence items, and ${verifiedCitations.length} verified regional knowledge record(s).`,
-      is_ai_suggested: true,
-      review_status: ReviewStatus.AI_SUGGESTED_PENDING_REVIEW,
-      reviewed_by: null,
-      reviewer_notes: null,
-      deleted_at: null,
+    return {
+      id: updatedRun.id,
+      prospect_id: updatedRun.prospectId,
+      run_type: updatedRun.runType,
+      status: updatedRun.status,
+      executed_rule_versions: updatedRun.executedRuleVersions,
+      ai_model_used: updatedRun.aiModelUsed,
+      started_at: updatedRun.startedAt.toISOString(),
+      completed_at: updatedRun.completedAt?.toISOString() ?? null,
     };
-    store.hypotheses.set(hypId, hyp);
-    hypothesesForRanking.push({ hyp, elemType });
+  } catch (error) {
+    console.error("Falsification engine failed:", error);
+    throw new Error("Database query failed. Please try again later.", { cause: error });
   }
-
-  // Generate & rank discriminating investigations
-  store.investigations = store.investigations.filter(
-    (inv) =>
-      !(inv.prospect_id === prospect.id && inv.organisation_id === prospect.organisation_id)
-  );
-
-  const scored = hypothesesForRanking
-    .map(({ hyp, elemType }) => {
-      const baseScore = ELEMENT_DISCRIMINATION_WEIGHT[elemType] ?? 50;
-      const gapBonus = Math.min(hyp.missing_evidence.length * 4, 20);
-      return { score: baseScore + gapBonus, hyp, elemType };
-    })
-    .sort((a, b) => b.score - a.score);
-
-  scored.forEach((item, idx) => {
-    const rank = idx + 1;
-    const [title, obj, reqTest, feasibility] = INVESTIGATION_TEMPLATES[item.elemType];
-    const decisionRel = rank <= 3 ? "CRITICAL" : rank <= 6 ? "HIGH" : "MODERATE";
-
-    const inv: Investigation = {
-      id: crypto.randomUUID(),
-      organisation_id: prospect.organisation_id,
-      prospect_id: prospect.id,
-      hypothesis_id: item.hyp.id,
-      title,
-      discriminating_objective: obj,
-      required_data_or_test: reqTest,
-      user_supplied_cost_estimate: null,
-      user_supplied_time_estimate: null,
-      technical_feasibility_note: feasibility,
-      priority_rank: rank,
-      decision_relevance: decisionRel,
-      discrimination_power: `Directly tests ${item.elemType} failure hypothesis (Rank #${rank})`,
-      prioritisation_rationale: `Ranked #${rank} based on structural/petroleum-system criticality of ${item.elemType} and ${item.hyp.missing_evidence.length} unresolved evidence gap(s). Cost and duration remain user-supplied.`,
-    };
-    store.investigations.push(inv);
-  });
-
-  run.completed_at = new Date().toISOString();
-  return run;
 }

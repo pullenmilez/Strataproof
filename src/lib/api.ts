@@ -1,4 +1,5 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/api/v1";
+const DEFAULT_TIMEOUT_MS = 25000;
 
 export interface AuthSession {
   access_token: string;
@@ -21,14 +22,27 @@ export async function apiRequest<T>(
     headers.set("X-Organisation-ID", session.organisation_id);
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
 
-  if (!res.ok) {
-    const errBody = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(errBody.detail || `API Error (${res.status})`);
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers,
+      signal: options.signal ?? controller.signal,
+    });
+
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(errBody.detail || `API Error (${res.status})`);
+    }
+    return res.json() as Promise<T>;
+  } catch (err: unknown) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("Request timed out. Please try again.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  return res.json() as Promise<T>;
 }

@@ -1,6 +1,9 @@
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
-import { createAccessToken, verifyPassword } from "@/server/auth";
-import { getStore } from "@/server/store";
+import { db } from "@/db/index.ts";
+import { organisationMemberships, users } from "@/db/schema.ts";
+import { createAccessToken, verifyPassword } from "@/server/auth.ts";
+import { UserRole } from "@/server/enums.ts";
 
 export async function POST(req: NextRequest) {
   try {
@@ -8,21 +11,25 @@ export async function POST(req: NextRequest) {
     const email = String(payload.email || "").toLowerCase().trim();
     const password = String(payload.password || "");
 
-    const store = getStore();
-    const user = Array.from(store.users.values()).find(
-      (u) => u.email === email && u.is_active
-    );
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(and(eq(users.email, email), eq(users.isActive, true)));
 
-    if (!user || !verifyPassword(password, user.password_hash)) {
-      return NextResponse.json(
-        { detail: "Invalid email or password." },
-        { status: 401 }
-      );
+    if (!user || !verifyPassword(password, user.passwordHash)) {
+      return NextResponse.json({ detail: "Invalid email or password." }, { status: 401 });
     }
 
-    const membership = store.memberships
-      .filter((m) => m.user_id === user.id && m.deleted_at === null)
-      .sort((a, b) => Number(b.is_default) - Number(a.is_default))[0];
+    const [membership] = await db
+      .select()
+      .from(organisationMemberships)
+      .where(
+        and(
+          eq(organisationMemberships.userId, user.id),
+          isNull(organisationMemberships.deletedAt)
+        )
+      )
+      .orderBy(desc(organisationMemberships.isDefault));
 
     if (!membership) {
       return NextResponse.json(
@@ -31,20 +38,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const token = createAccessToken(
-      user.id,
-      membership.organisation_id,
-      membership.role
-    );
+    const role = membership.role as UserRole;
+    const token = createAccessToken(user.id, membership.organisationId, role);
 
     return NextResponse.json({
       access_token: token,
       token_type: "bearer",
       user_id: user.id,
-      organisation_id: membership.organisation_id,
-      role: membership.role,
+      organisation_id: membership.organisationId,
+      role,
     });
-  } catch {
-    return NextResponse.json({ detail: "Invalid login payload." }, { status: 400 });
+  } catch (error) {
+    console.error("Login failed:", error);
+    return NextResponse.json({ detail: "Login failed. Please try again." }, { status: 500 });
   }
 }
